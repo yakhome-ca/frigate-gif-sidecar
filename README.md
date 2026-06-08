@@ -77,9 +77,9 @@ All in `.env`:
 
 | Var | Default | Effect |
 |---|---|---|
-| `GIF_FPS` | `3` | Higher = smoother, larger file. 3fps feels "security camera" flippy in a good way. |
+| `GIF_FPS` | `8` | Higher = smoother + faster perceived playback (each frame held shorter), larger file. 8fps = 125ms per frame, feels like motion not stop-motion. |
 | `GIF_WIDTH` | `480` | Output width (height auto, preserves aspect). 480 sits under Android's notif-image soft budget without thumbnailing. |
-| `GIF_MAX_SECONDS` | `8` | Cap on transcoded clip length. 8s catches arrival + dwell without ballooning the GIF. |
+| `GIF_MAX_SECONDS` | `6` | Cap on transcoded clip length. 6s catches arrival + dwell. Shorter = snappier loop. |
 | `GIF_RETENTION_HOURS` | `24` | Auto-deleted from disk after this |
 | `IGNORE_SUBLABELS` | `Josh` | Comma-separated faces to skip entirely |
 
