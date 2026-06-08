@@ -14,7 +14,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: frigate-gif-sidecar:latest
+    pull_policy: build
     restart: unless-stopped
     env_file:
       - .env
