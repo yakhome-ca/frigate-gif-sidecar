@@ -48,6 +48,11 @@ IGNORE_SUBLABELS = set(s.strip() for s in os.environ.get("IGNORE_SUBLABELS", "Jo
 GIF_FPS = int(os.environ.get("GIF_FPS", "8"))
 GIF_WIDTH = int(os.environ.get("GIF_WIDTH", "480"))
 GIF_MAX_SECONDS = int(os.environ.get("GIF_MAX_SECONDS", "6"))  # cap clip length we transcode
+# Wall-clock playback speedup. 1.0 = real time. 3.0 = the same frames render
+# in 1/3 the time → motion appears 3× faster. Different from GIF_FPS, which
+# controls how smoothly motion is sampled (and file size). Implemented as
+# `setpts=PTS/<speedup>` in the ffmpeg filter chain.
+GIF_SPEEDUP = float(os.environ.get("GIF_SPEEDUP", "3.0"))
 GIF_RETENTION_HOURS = int(os.environ.get("GIF_RETENTION_HOURS", "24"))
 CLIP_FETCH_TIMEOUT_S = int(os.environ.get("CLIP_FETCH_TIMEOUT_S", "45"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -70,7 +75,13 @@ _in_flight_lock = threading.Lock()
 # --- ffmpeg ------------------------------------------------------------------
 
 def _palette_filter() -> str:
-    return f"fps={GIF_FPS},scale={GIF_WIDTH}:-2:flags=lanczos"
+    base = f"fps={GIF_FPS},scale={GIF_WIDTH}:-2:flags=lanczos"
+    if GIF_SPEEDUP and abs(GIF_SPEEDUP - 1.0) > 1e-3:
+        # setpts compresses the presentation timestamps of each frame, so the
+        # same frames play in 1/SPEEDUP the time. Apply BEFORE palettegen so
+        # palette stats reflect what will actually be encoded.
+        return f"{base},setpts=PTS/{GIF_SPEEDUP}"
+    return base
 
 
 def transcode_to_gif(mp4_path: Path, gif_path: Path) -> None:
@@ -238,9 +249,9 @@ def on_connect(client: mqtt.Client, _userdata, _flags, rc, _props=None) -> None:
 def main() -> None:
     log.info(
         "starting: frigate=%s mqtt=%s:%d cameras=%s labels=%s zone=%s ignore=%s "
-        "gif=%dx_@%dfps cap=%ds out=%s retain=%dh",
+        "gif=%dx_@%dfps speedup=%.1fx cap=%ds out=%s retain=%dh",
         FRIGATE_URL, MQTT_HOST, MQTT_PORT, CAMERAS, LABELS, REQUIRED_ZONE,
-        IGNORE_SUBLABELS, GIF_WIDTH, GIF_FPS, GIF_MAX_SECONDS, OUTPUT_DIR, GIF_RETENTION_HOURS,
+        IGNORE_SUBLABELS, GIF_WIDTH, GIF_FPS, GIF_SPEEDUP, GIF_MAX_SECONDS, OUTPUT_DIR, GIF_RETENTION_HOURS,
     )
     cleanup_old_gifs()
     threading.Thread(target=cleanup_loop, daemon=True).start()

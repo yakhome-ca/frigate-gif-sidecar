@@ -77,9 +77,10 @@ All in `.env`:
 
 | Var | Default | Effect |
 |---|---|---|
-| `GIF_FPS` | `8` | Higher = smoother + faster perceived playback (each frame held shorter), larger file. 8fps = 125ms per frame, feels like motion not stop-motion. |
+| `GIF_FPS` | `8` | Sample rate from source — controls smoothness + file size. 8fps catches most motion without bloating. |
+| `GIF_SPEEDUP` | `3.0` | Wall-clock playback speedup. 3.0 = motion appears 3× faster (`setpts=PTS/3.0` in the filter). Doesn't change file size, just the per-frame delay. |
 | `GIF_WIDTH` | `480` | Output width (height auto, preserves aspect). 480 sits under Android's notif-image soft budget without thumbnailing. |
-| `GIF_MAX_SECONDS` | `6` | Cap on transcoded clip length. 6s catches arrival + dwell. Shorter = snappier loop. |
+| `GIF_MAX_SECONDS` | `6` | Cap on transcoded clip length. 6s of source × 3× speedup = ~2s GIF wall time. |
 | `GIF_RETENTION_HOURS` | `24` | Auto-deleted from disk after this |
 | `IGNORE_SUBLABELS` | `Josh` | Comma-separated faces to skip entirely |
 
