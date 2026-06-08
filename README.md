@@ -38,23 +38,21 @@ doesn't ship a writable `/tmp` palette workflow. A tiny sidecar is one container
 
 ## Pre-deploy checklist
 
-1. **Find HA's www host path** (so the sidecar writes where HA serves):
+HA runs in HA-OS in a Proxmox VM, so we write to its `/config/www` via the
+**Samba share addon** (already installed) using Docker's built-in `cifs`
+volume driver. No bind-mount, no host fstab changes.
 
-   ```bash
-   docker inspect homeassistant \
-     --format '{{ range .Mounts }}{{ if eq .Destination "/config" }}{{ .Source }}{{ end }}{{ end }}'
-   ```
+1. **Copy `.env.example` → `.env`** and fill in:
+   - `MQTT_PASS` — Frigate's MQTT user works as-is
+   - `SMB_USER` / `SMB_PASS` — from the HA UI: Settings → Add-ons → Samba share →
+     Configuration tab. The username defaults to `josh`.
+   - `HA_HOST` — `192.168.10.103` for the yakhome install.
 
-   Append `/www`. Put it in `.env` as `HA_WWW_PATH`.
+2. **Deploy via Komodo**: stack is `yakhome-ca/frigate-gif-sidecar`. Let Komodo
+   clone, build the image, and bring it up.
 
-   The sidecar will write to `$HA_WWW_PATH/frigate_gifs/` — HA serves that at
-   `/local/frigate_gifs/<id>.gif`.
-
-2. **Copy `.env.example` → `.env`**, fill in `HA_WWW_PATH` and `MQTT_PASS`. The
-   Frigate MQTT user works as-is.
-
-3. **Deploy via Komodo**: add this folder to your stacks repo, point a new
-   Komodo stack at it, let Komodo build the image and bring it up.
+3. The cifs volume mount needs the host kernel `cifs` module — Debian ships it
+   by default, so home-debian is fine.
 
 ## Verifying it's working
 
@@ -64,8 +62,8 @@ After someone (not Josh) walks up to the doorbell:
 # 1. The sidecar logged a match + ffmpeg + ready-publish:
 docker logs frigate-gif-sidecar --tail 50
 
-# 2. A GIF file exists:
-ls -lh $HA_WWW_PATH/frigate_gifs/ | tail
+# 2. A GIF file exists (from any host that can hit HA's Samba share):
+smbclient //$HA_HOST/config -U $SMB_USER -c 'ls www\frigate_gifs\*.gif'
 
 # 3. The ready topic was published (run before walking up):
 mosquitto_sub -h 192.168.10.103 -u mqtt -P "$PASS" -t 'frigate-gifs/ready/+' -v

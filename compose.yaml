@@ -4,13 +4,10 @@
 # events, transcodes to a low-fps palette-optimized GIF, writes it where HA can
 # serve it at /local/frigate_gifs/<id>.gif, and publishes frigate-gifs/ready/<id>.
 #
-# REQUIRED before first deploy:
-#   1. Set HA_WWW_PATH (see .env.example). On home-debian, find it with:
-#         docker inspect homeassistant \
-#           --format '{{ range .Mounts }}{{ if eq .Destination "/config" }}{{ .Source }}{{ end }}{{ end }}'
-#      The www path is "$HA_CONFIG/www".
-#   2. Set MQTT credentials in the .env (Frigate's MQTT user works).
-#
+# HA runs in HA-OS on 192.168.10.103, NOT as a docker container — so we can't
+# bind-mount HA's /config/www. Instead we use Docker's built-in cifs volume
+# driver to mount the HA Samba addon's `config` share, and write into
+# /config/www/frigate_gifs/ over SMB. HA serves it at /local/frigate_gifs/.
 services:
   frigate-gif-sidecar:
     container_name: frigate-gif-sidecar
@@ -21,11 +18,13 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # main.py writes to $OUTPUT_DIR; we mount the HA `config` share at /ha_config
+      # and target the www/frigate_gifs subdir. main.py mkdirs it if needed.
+      OUTPUT_DIR: /ha_config/www/frigate_gifs
     volumes:
-      - ${HA_WWW_PATH:?set HA_WWW_PATH in .env}/frigate_gifs:/output
+      - ha_config:/ha_config
     healthcheck:
-      # If the python process dies, restart picks it back up. This is a
-      # connectivity smoke-test against the MQTT broker.
       test: ["CMD-SHELL", "python -c \"import socket,os; s=socket.create_connection((os.environ['MQTT_HOST'], int(os.environ.get('MQTT_PORT','1883'))), timeout=3); s.close()\""]
       interval: 60s
       timeout: 5s
@@ -35,3 +34,16 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  ha_config:
+    driver: local
+    driver_opts:
+      type: cifs
+      # vers=3.0 = SMB3 (HA Samba addon supports it). soft = don't hang the container
+      # on broker hiccups. nofail wouldn't apply here since this is a docker driver,
+      # but `soft` + healthcheck restart gives us self-healing.
+      # uid/gid 1000 is what HA-OS's Samba addon maps writes to — files end up
+      # owned by the addon's internal user, readable by HA.
+      o: "username=${SMB_USER:?set SMB_USER in .env},password=${SMB_PASS:?set SMB_PASS in .env},rw,vers=3.0,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,soft"
+      device: "//${HA_HOST:?set HA_HOST in .env}/config"

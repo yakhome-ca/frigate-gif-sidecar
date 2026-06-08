@@ -10,8 +10,9 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py /app/main.py
 
-# Output dir is bind-mounted at runtime to HA's /config/www/frigate_gifs.
-# The mkdir in main.py covers the case where the bind isn't created yet.
+# Output dir is a CIFS-mounted HA Samba share — uid/gid 1000 in the compose
+# matches HA-OS's Samba addon write-mapping, so we run as 1000 too for clean
+# write permissions on the share.
 ENV PYTHONUNBUFFERED=1
-USER nobody
+USER 1000:1000
 CMD ["python", "-u", "main.py"]
