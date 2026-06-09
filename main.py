@@ -66,6 +66,85 @@ log = logging.getLogger("gif-sidecar")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- doorbell redirect helper -----------------------------------------------
+# We also ship a tiny static HTML page that the notification clickAction points
+# at. When tapped, the page reads ?event_id=<id> from its URL, stamps it into
+# HA's input_text.doorbell_viewing_event_id via the REST API (using the auth
+# token from localStorage, which is same-origin with HA), then redirects to the
+# cameras dashboard. The dashboard's "Doorbell clip" card reads that helper to
+# show THIS clip, not whatever's currently in the latest-event helper.
+#
+# Writing it from here (vs a separate sidecar) because we already have the
+# cifs mount and the file is small + rarely changes.
+
+_DOORBELL_REDIRECT_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Doorbell — opening clip</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#bbb;
+    font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    display:grid;place-items:center;}
+  .spinner{width:48px;height:48px;border:4px solid #333;border-top-color:#3a8;
+    border-radius:50%;animation:s 1s linear infinite;margin:0 auto 16px;}
+  @keyframes s{to{transform:rotate(360deg);}}
+  .msg{text-align:center;opacity:.7;}
+</style>
+</head><body>
+<div><div class="spinner"></div><div class="msg">Opening clip…</div></div>
+<script>
+(async () => {
+  const params = new URLSearchParams(window.location.search);
+  const eventId = params.get('event_id') || '';
+  const target = '/frigate-cameras';
+
+  let token = null;
+  try {
+    const stored = localStorage.getItem('hassTokens');
+    if (stored) token = JSON.parse(stored).access_token;
+  } catch (e) {}
+
+  if (eventId && token) {
+    try {
+      await fetch('/api/services/input_text/set_value', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          entity_id: 'input_text.doorbell_viewing_event_id',
+          value: eventId
+        })
+      });
+    } catch (e) {}
+  }
+
+  window.location.replace(target);
+})();
+</script>
+</body></html>
+"""
+
+
+def install_doorbell_redirect_html() -> None:
+    """Drop the static redirect page into HA's www folder. Called at startup;
+    overwrites on every boot so updates to the page roll out with sidecar
+    redeploys (cheap; ~2 KB)."""
+    # The cifs mount roots at the share's `config` so /ha_config/www maps to
+    # HA's `/config/www` which it serves at /local/.
+    target = Path("/ha_config/www/doorbell-redirect.html")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_DOORBELL_REDIRECT_HTML, encoding="utf-8")
+        log.info("redirect page installed: %s (%d bytes)", target, target.stat().st_size)
+    except Exception:
+        log.exception("failed to install doorbell-redirect.html (continuing anyway)")
+
+
+install_doorbell_redirect_html()
+
 # Track which event IDs are already being processed so a noisy /events stream
 # can't fire us twice for the same id.
 _in_flight: set[str] = set()
