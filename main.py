@@ -220,6 +220,19 @@ def fetch_clip(evt_id: str, dest: Path) -> bool:
 
 # --- event handling ----------------------------------------------------------
 
+def sublabel_name(after: dict):
+    """Frigate's event `sub_label` is a [name, score] pair (e.g. ['Josh', 0.98]),
+    not a bare string — and it's None when unrecognized. Return just the name.
+
+    Indexing [0] matters for correctness AND safety: `['Josh', 0.98] in {'Josh'}`
+    raises `TypeError: unhashable type: 'list'`, which previously crashed the MQTT
+    loop on every recognized face."""
+    sl = after.get("sub_label")
+    if isinstance(sl, (list, tuple)):
+        return sl[0] if sl else None
+    return sl
+
+
 def should_process(after: dict) -> tuple[bool, str]:
     """Returns (process?, reason). Reason is for log clarity only."""
     if after.get("camera") not in CAMERAS:
@@ -228,7 +241,7 @@ def should_process(after: dict) -> tuple[bool, str]:
         return False, "label-skip"
     if REQUIRED_ZONE and REQUIRED_ZONE not in (after.get("entered_zones") or []):
         return False, "no-zone"
-    if after.get("sub_label") in IGNORE_SUBLABELS:
+    if sublabel_name(after) in IGNORE_SUBLABELS:
         return False, "ignored-sublabel"
     return True, "match"
 
@@ -285,7 +298,7 @@ def on_message(client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
     if not evt_id:
         return
     log.info("evt=%s match (camera=%s label=%s sub_label=%s)",
-             evt_id, after.get("camera"), after.get("label"), after.get("sub_label"))
+             evt_id, after.get("camera"), after.get("label"), sublabel_name(after))
     # offload to a worker thread so MQTT loop stays responsive
     threading.Thread(target=process_event, args=(client, evt_id), daemon=True).start()
 
