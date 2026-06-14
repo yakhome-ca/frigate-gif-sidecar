@@ -8,8 +8,12 @@ it where Home Assistant can serve it at /local/frigate_gifs/<id>.gif, and
 publishes `frigate-gifs/ready/<id>` so HA can update the live notification.
 
 Design notes:
-- We listen to type=end (not type=new) because clip.mp4 only exists after Frigate
-  finalizes the recording. Even then there's a small lag — we retry with backoff.
+- We pull a FIXED window [start, start+GIF_WINDOW_SECONDS] from Frigate's
+  continuous *recordings* (not the event's clip.mp4). The event clip only exists
+  after the event ENDS, so a visitor who lingers 50s used to delay the GIF by 50s.
+  The recordings window is available a fixed ~15-20s after the person appears,
+  regardless of dwell time. We fire on the first event message where the person
+  has entered the required zone, then retry-fetch the window until it finalizes.
 - Two-pass palette (stats_mode=diff + paletteuse dither=bayer:5) gives much better
   visual quality at the same byte budget than single-pass GIF encoding.
 - 5 fps × 720 wide × ~10s clip ≈ 1.5–2 MB. Fits comfortably in Android's
@@ -48,6 +52,9 @@ IGNORE_SUBLABELS = set(s.strip() for s in os.environ.get("IGNORE_SUBLABELS", "Jo
 GIF_FPS = int(os.environ.get("GIF_FPS", "8"))
 GIF_WIDTH = int(os.environ.get("GIF_WIDTH", "480"))
 GIF_MAX_SECONDS = int(os.environ.get("GIF_MAX_SECONDS", "6"))  # cap clip length we transcode
+# Length of the recordings window we pull, measured from the event's start_time.
+# Defaults to GIF_MAX_SECONDS (no point grabbing more than we transcode).
+GIF_WINDOW_SECONDS = int(os.environ.get("GIF_WINDOW_SECONDS", str(os.environ.get("GIF_MAX_SECONDS", "6"))))
 # Wall-clock playback speedup. 1.0 = real time. 3.0 = the same frames render
 # in 1/3 the time → motion appears 3× faster. Different from GIF_FPS, which
 # controls how smoothly motion is sampled (and file size). Implemented as
@@ -145,10 +152,11 @@ def install_doorbell_redirect_html() -> None:
 
 install_doorbell_redirect_html()
 
-# Track which event IDs are already being processed so a noisy /events stream
-# can't fire us twice for the same id.
-_in_flight: set[str] = set()
-_in_flight_lock = threading.Lock()
+# Track which event IDs we've already kicked off (with the time we did so, for
+# pruning). A noisy /events stream sends many new/update/end messages per event;
+# we process the FIRST one that qualifies and ignore the rest for that id.
+_handled: dict[str, float] = {}
+_handled_lock = threading.Lock()
 
 
 # --- ffmpeg ------------------------------------------------------------------
@@ -193,9 +201,12 @@ def transcode_to_gif(mp4_path: Path, gif_path: Path) -> None:
 
 # --- Frigate clip fetch ------------------------------------------------------
 
-def fetch_clip(evt_id: str, dest: Path) -> bool:
-    """Retry-with-backoff GET on Frigate clip.mp4. Returns True iff downloaded."""
-    url = f"{FRIGATE_URL}/api/events/{evt_id}/clip.mp4"
+def fetch_mp4(url: str, dest: Path, evt_id: str) -> bool:
+    """Retry-with-backoff GET on a Frigate mp4 URL. Returns True iff downloaded.
+
+    Used against the recordings export endpoint, whose segments only finalize a
+    few seconds after real time — so a fetch for a window that just ended 404/400s
+    until Frigate has written it. We back off and retry up to CLIP_FETCH_TIMEOUT_S."""
     delays = [1, 2, 3, 4, 5, 7, 10, 13]   # ~45s total
     waited = 0
     for delay in delays:
@@ -208,7 +219,8 @@ def fetch_clip(evt_id: str, dest: Path) -> bool:
                 return True
             dest.unlink(missing_ok=True)
         except HTTPError as e:
-            if e.code != 404:
+            # 404/400 = window not finalized yet; expected during the backoff.
+            if e.code not in (404, 400):
                 log.warning("evt=%s clip fetch HTTP %s", evt_id, e.code)
         except URLError as e:
             log.warning("evt=%s clip fetch URL error: %s", evt_id, e)
@@ -246,16 +258,16 @@ def should_process(after: dict) -> tuple[bool, str]:
     return True, "match"
 
 
-def process_event(client: mqtt.Client, evt_id: str) -> None:
-    with _in_flight_lock:
-        if evt_id in _in_flight:
-            log.debug("evt=%s already in flight, skipping", evt_id)
-            return
-        _in_flight.add(evt_id)
+def process_event(client: mqtt.Client, evt_id: str, camera: str, start_ts: int) -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             mp4 = Path(tmp) / f"{evt_id}.mp4"
-            if not fetch_clip(evt_id, mp4):
+            # Frigate recordings export: build an mp4 for [start, start+window]
+            # straight from continuous recordings — no need to wait for the event
+            # to end. Available a fixed ~15-20s after the person appears.
+            end_ts = start_ts + GIF_WINDOW_SECONDS
+            url = f"{FRIGATE_URL}/api/{camera}/start/{start_ts}/end/{end_ts}/clip.mp4"
+            if not fetch_mp4(url, mp4, evt_id):
                 return
             gif = OUTPUT_DIR / f"{evt_id}.gif"
             t0 = time.time()
@@ -275,9 +287,8 @@ def process_event(client: mqtt.Client, evt_id: str) -> None:
                 "transcode_ms": took_ms,
             })
             client.publish(f"frigate-gifs/ready/{evt_id}", payload, qos=0, retain=False)
-    finally:
-        with _in_flight_lock:
-            _in_flight.discard(evt_id)
+    except Exception:
+        log.exception("evt=%s processing failed", evt_id)
 
 
 def on_message(client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
@@ -287,20 +298,31 @@ def on_message(client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
         payload = json.loads(msg.payload)
     except json.JSONDecodeError:
         return
-    if payload.get("type") != "end":
+    # Act on the FIRST message (new/update/end) where the visitor has entered the
+    # required zone — we no longer wait for type=end, since we pull from recordings.
+    if payload.get("type") not in ("new", "update", "end"):
         return
     after = payload.get("after") or {}
-    ok, reason = should_process(after)
+    ok, _reason = should_process(after)
     if not ok:
-        log.debug("evt=%s skipped: %s", after.get("id"), reason)
         return
     evt_id = after.get("id")
-    if not evt_id:
+    start_time = after.get("start_time")
+    if not evt_id or not start_time:
         return
-    log.info("evt=%s match (camera=%s label=%s sub_label=%s)",
-             evt_id, after.get("camera"), after.get("label"), sublabel_name(after))
+    with _handled_lock:
+        if evt_id in _handled:
+            return
+        _handled[evt_id] = time.time()
+    log.info("evt=%s match (camera=%s label=%s sub_label=%s type=%s) — grabbing [start,+%ds] from recordings",
+             evt_id, after.get("camera"), after.get("label"), sublabel_name(after),
+             payload.get("type"), GIF_WINDOW_SECONDS)
     # offload to a worker thread so MQTT loop stays responsive
-    threading.Thread(target=process_event, args=(client, evt_id), daemon=True).start()
+    threading.Thread(
+        target=process_event,
+        args=(client, evt_id, after.get("camera"), int(start_time)),
+        daemon=True,
+    ).start()
 
 
 # --- cleanup -----------------------------------------------------------------
@@ -317,6 +339,11 @@ def cleanup_old_gifs() -> None:
             pass
     if removed:
         log.info("cleanup: removed %d gif(s) older than %dh", removed, GIF_RETENTION_HOURS)
+    # prune the de-dup map — an event id never recurs after a couple hours.
+    with _handled_lock:
+        stale = [k for k, t in _handled.items() if t < time.time() - 7200]
+        for k in stale:
+            _handled.pop(k, None)
 
 
 def cleanup_loop() -> None:
