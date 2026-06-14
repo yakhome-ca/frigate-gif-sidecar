@@ -104,7 +104,7 @@ _DOORBELL_REDIRECT_HTML = r"""<!doctype html>
 (async () => {
   const params = new URLSearchParams(window.location.search);
   const eventId = params.get('event_id') || '';
-  const target = '/frigate-cameras';
+  const target = '/doorbell-clip';
 
   let token = null;
   try {
