@@ -15,7 +15,12 @@ services:
       context: .
       dockerfile: Dockerfile
     pull_policy: build
-    restart: unless-stopped
+    # `always`, not `unless-stopped`: if the host/daemon goes down while this
+    # container is in a stopped state (e.g. it crashed first), `unless-stopped`
+    # would NOT bring it back on daemon restart. `always` does. This bit us on
+    # 2026-06-24 when home-debian got caught in the UnRAID power incident — the
+    # sidecar exited and sat dead for ~6 days (RestartCount stayed 0).
+    restart: always
     env_file:
       - .env
     environment:
