@@ -135,22 +135,69 @@ _DOORBELL_REDIRECT_HTML = r"""<!doctype html>
 """
 
 
-def install_doorbell_redirect_html() -> None:
-    """Drop the static redirect page into HA's www folder. Called at startup;
-    overwrites on every boot so updates to the page roll out with sidecar
-    redeploys (cheap; ~2 KB)."""
-    # The cifs mount roots at the share's `config` so /ha_config/www maps to
-    # HA's `/config/www` which it serves at /local/.
-    target = Path("/ha_config/www/doorbell-redirect.html")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_DOORBELL_REDIRECT_HTML, encoding="utf-8")
-        log.info("redirect page installed: %s (%d bytes)", target, target.stat().st_size)
-    except Exception:
-        log.exception("failed to install doorbell-redirect.html (continuing anyway)")
+# Inline HTML5 clip player for the /doorbell-clip dashboard. Embedded in an
+# `iframe` card (Lovelace won't render templates in a card's tap_action URL,
+# so the dashboard can't build a per-event clip URL itself). This page reads
+# input_text.doorbell_viewing_event_id at runtime and plays that exact event's
+# clip via Frigate's UNAUTHENTICATED notifications proxy. Same-origin iframe
+# inside HA, so localStorage.hassTokens is available for the state read.
+_DOORBELL_CLIP_PLAYER_HTML = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#000}
+  #v{width:100%;height:100%;object-fit:contain;background:#000}
+  #msg{color:#bbb;font-family:sans-serif;text-align:center;padding:1.2em;font-size:15px}
+</style>
+</head>
+<body>
+<video id="v" controls autoplay playsinline></video>
+<div id="msg" style="display:none">No clip selected yet.</div>
+<script>
+(function(){
+  var v=document.getElementById('v'), msg=document.getElementById('msg');
+  function fail(t){ v.style.display='none'; msg.style.display='block'; if(t) msg.textContent=t; }
+  function token(){ try{ return JSON.parse(localStorage.hassTokens).access_token; }catch(e){ return null; } }
+  var t=token();
+  if(!t){ fail('Open this from inside Home Assistant.'); return; }
+  fetch('/api/states/input_text.doorbell_viewing_event_id',{headers:{Authorization:'Bearer '+t}})
+   .then(function(r){ return r.json(); })
+   .then(function(s){
+     var id=s && s.state;
+     if(!id || id==='unknown' || id==='unavailable' || id===''){ fail('No clip selected yet.'); return; }
+     v.src='/api/frigate/notifications/'+id+'/clip.mp4';
+     v.onerror=function(){ fail('Clip not ready yet - tap reload in a moment.'); };
+   })
+   .catch(function(){ fail('Could not load clip.'); });
+})();
+</script>
+</body>
+</html>
+"""
 
 
-install_doorbell_redirect_html()
+def install_www_pages() -> None:
+    """Drop the static helper pages into HA's www folder. Called at startup;
+    overwrites on every boot so updates roll out with sidecar redeploys (cheap).
+    The cifs mount roots at the share's `config` so /ha_config/www maps to HA's
+    `/config/www`, served at /local/."""
+    pages = {
+        "doorbell-redirect.html": _DOORBELL_REDIRECT_HTML,
+        "doorbell-clip-player.html": _DOORBELL_CLIP_PLAYER_HTML,
+    }
+    for name, html in pages.items():
+        target = Path("/ha_config/www") / name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(html, encoding="utf-8")
+            log.info("www page installed: %s (%d bytes)", target, target.stat().st_size)
+        except Exception:
+            log.exception("failed to install %s (continuing anyway)", name)
+
+
+install_www_pages()
 
 # Track which event IDs we've already kicked off (with the time we did so, for
 # pruning). A noisy /events stream sends many new/update/end messages per event;
