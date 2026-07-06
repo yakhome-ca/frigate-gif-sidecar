@@ -154,23 +154,31 @@ _DOORBELL_CLIP_PLAYER_HTML = r"""<!doctype html>
 </head>
 <body>
 <video id="v" controls autoplay playsinline></video>
-<div id="msg" style="display:none">No clip selected yet.</div>
+<div id="msg" style="display:none">No clip yet.</div>
 <script>
 (function(){
-  var v=document.getElementById('v'), msg=document.getElementById('msg');
+  var v=document.getElementById('v'), msg=document.getElementById('msg'), tries=0;
   function fail(t){ v.style.display='none'; msg.style.display='block'; if(t) msg.textContent=t; }
-  function token(){ try{ return JSON.parse(localStorage.hassTokens).access_token; }catch(e){ return null; } }
-  var t=token();
-  if(!t){ fail('Open this from inside Home Assistant.'); return; }
-  fetch('/api/states/input_text.doorbell_viewing_event_id',{headers:{Authorization:'Bearer '+t}})
-   .then(function(r){ return r.json(); })
-   .then(function(s){
-     var id=s && s.state;
-     if(!id || id==='unknown' || id==='unavailable' || id===''){ fail('No clip selected yet.'); return; }
-     v.src='/api/frigate/notifications/'+id+'/clip.mp4';
-     v.onerror=function(){ fail('Clip not ready yet - tap reload in a moment.'); };
-   })
-   .catch(function(){ fail('Could not load clip.'); });
+  // Fetch the current event id from a PUBLIC json (sidecar-written). No auth
+  // token needed: both /local/ files and the clip proxy are unauthenticated,
+  // so this plays in any context (app, browser, same-origin iframe).
+  function load(){
+    fetch('/local/doorbell-latest.json?t=' + Date.now(), {cache:'no-store'})
+     .then(function(r){ return r.json(); })
+     .then(function(j){
+       var id = j && j.event_id;
+       if(!id){ fail('No clip yet.'); return; }
+       v.style.display='block'; msg.style.display='none';
+       v.src = '/api/frigate/notifications/' + id + '/clip.mp4';
+     })
+     .catch(function(){ fail('No clip yet.'); });
+  }
+  // If the clip 404s (event still finalizing), retry a few times before giving up.
+  v.addEventListener('error', function(){
+    if(tries++ < 6){ setTimeout(function(){ v.load(); }, 3000); }
+    else { fail('Clip not ready - reload in a moment.'); }
+  });
+  load();
 })();
 </script>
 </body>
@@ -198,6 +206,18 @@ def install_www_pages() -> None:
 
 
 install_www_pages()
+
+
+def write_latest_pointer(evt_id: str) -> None:
+    """Publish the current event id to a PUBLIC json so the /doorbell-clip iframe
+    player can fetch it WITHOUT an auth token. Written at match time (event start),
+    so the player points at the current visitor; the clip.mp4 itself becomes
+    available a little later (player retries)."""
+    try:
+        (Path("/ha_config/www") / "doorbell-latest.json").write_text(
+            json.dumps({"event_id": evt_id, "ts": int(time.time())}), encoding="utf-8")
+    except Exception:
+        log.exception("failed to write doorbell-latest.json (continuing anyway)")
 
 # Track which event IDs we've already kicked off (with the time we did so, for
 # pruning). A noisy /events stream sends many new/update/end messages per event;
@@ -364,6 +384,7 @@ def on_message(client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
     log.info("evt=%s match (camera=%s label=%s sub_label=%s type=%s) — grabbing [start,+%ds] from recordings",
              evt_id, after.get("camera"), after.get("label"), sublabel_name(after),
              payload.get("type"), GIF_WINDOW_SECONDS)
+    write_latest_pointer(evt_id)
     # offload to a worker thread so MQTT loop stays responsive
     threading.Thread(
         target=process_event,
