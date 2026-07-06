@@ -45,6 +45,11 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/output"))
+# Web-playable clips for the /doorbell-clip iframe player go here (served at
+# /local/frigate_clips). MUST be under /local: HA serves /local with byte-range
+# (206) which <video> needs; Frigate's notifications proxy returns 200 with NO
+# range support, which mobile browsers can't play (broken-media icon).
+CLIP_DIR = OUTPUT_DIR.parent / "frigate_clips"
 CAMERAS = set(os.environ.get("CAMERAS", "doorbell").split(","))
 LABELS = set(os.environ.get("LABELS", "person").split(","))
 REQUIRED_ZONE = os.environ.get("REQUIRED_ZONE", "property")
@@ -72,6 +77,7 @@ logging.basicConfig(
 log = logging.getLogger("gif-sidecar")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- doorbell redirect helper -----------------------------------------------
 # We also ship a tiny static HTML page that the notification clickAction points
@@ -153,15 +159,15 @@ _DOORBELL_CLIP_PLAYER_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-<video id="v" controls autoplay playsinline></video>
+<video id="v" controls autoplay muted playsinline></video>
 <div id="msg" style="display:none">No clip yet.</div>
 <script>
 (function(){
   var v=document.getElementById('v'), msg=document.getElementById('msg'), tries=0;
   function fail(t){ v.style.display='none'; msg.style.display='block'; if(t) msg.textContent=t; }
   // Fetch the current event id from a PUBLIC json (sidecar-written). No auth
-  // token needed: both /local/ files and the clip proxy are unauthenticated,
-  // so this plays in any context (app, browser, same-origin iframe).
+  // token needed. Play the /local clip (byte-range 206 supported, unlike the
+  // Frigate notifications proxy which returns 200 and breaks <video>).
   function load(){
     fetch('/local/doorbell-latest.json?t=' + Date.now(), {cache:'no-store'})
      .then(function(r){ return r.json(); })
@@ -169,13 +175,13 @@ _DOORBELL_CLIP_PLAYER_HTML = r"""<!doctype html>
        var id = j && j.event_id;
        if(!id){ fail('No clip yet.'); return; }
        v.style.display='block'; msg.style.display='none';
-       v.src = '/api/frigate/notifications/' + id + '/clip.mp4';
+       v.src = '/local/frigate_clips/' + id + '.mp4';
      })
      .catch(function(){ fail('No clip yet.'); });
   }
-  // If the clip 404s (event still finalizing), retry a few times before giving up.
+  // The clip is staged ~15-25s after the visitor appears; retry while it 404s.
   v.addEventListener('error', function(){
-    if(tries++ < 6){ setTimeout(function(){ v.load(); }, 3000); }
+    if(tries++ < 12){ setTimeout(function(){ v.load(); }, 3000); }
     else { fail('Clip not ready - reload in a moment.'); }
   });
   load();
@@ -325,6 +331,24 @@ def should_process(after: dict) -> tuple[bool, str]:
     return True, "match"
 
 
+def stage_player_clip(src_mp4: Path, evt_id: str) -> None:
+    """Remux the fetched window mp4 into /local/frigate_clips/<id>.mp4 with
+    +faststart so the dashboard iframe player can stream it. Served from /local,
+    HA honours byte-range (206) which <video> requires — the Frigate notifications
+    proxy does not, which is why direct-proxy playback showed a broken-media icon.
+    -c copy = no re-encode (h264 already browser-friendly), just a container remux."""
+    dest = CLIP_DIR / f"{evt_id}.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", str(src_mp4), "-c", "copy", "-movflags", "+faststart", str(dest)],
+            check=True)
+        log.info("evt=%s player clip staged: %s (%d bytes)", evt_id, dest, dest.stat().st_size)
+    except subprocess.CalledProcessError as e:
+        log.error("evt=%s player-clip remux failed rc=%s", evt_id, e.returncode)
+        dest.unlink(missing_ok=True)
+
+
 def process_event(client: mqtt.Client, evt_id: str, camera: str, start_ts: int) -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -336,6 +360,7 @@ def process_event(client: mqtt.Client, evt_id: str, camera: str, start_ts: int) 
             url = f"{FRIGATE_URL}/api/{camera}/start/{start_ts}/end/{end_ts}/clip.mp4"
             if not fetch_mp4(url, mp4, evt_id):
                 return
+            stage_player_clip(mp4, evt_id)
             gif = OUTPUT_DIR / f"{evt_id}.gif"
             t0 = time.time()
             try:
@@ -398,15 +423,15 @@ def on_message(client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
 def cleanup_old_gifs() -> None:
     cutoff = time.time() - GIF_RETENTION_HOURS * 3600
     removed = 0
-    for gif in OUTPUT_DIR.glob("*.gif"):
+    for old in list(OUTPUT_DIR.glob("*.gif")) + list(CLIP_DIR.glob("*.mp4")):
         try:
-            if gif.stat().st_mtime < cutoff:
-                gif.unlink()
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
                 removed += 1
         except FileNotFoundError:
             pass
     if removed:
-        log.info("cleanup: removed %d gif(s) older than %dh", removed, GIF_RETENTION_HOURS)
+        log.info("cleanup: removed %d old gif/clip file(s) older than %dh", removed, GIF_RETENTION_HOURS)
     # prune the de-dup map — an event id never recurs after a couple hours.
     with _handled_lock:
         stale = [k for k, t in _handled.items() if t < time.time() - 7200]
