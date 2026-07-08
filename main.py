@@ -153,38 +153,58 @@ _DOORBELL_CLIP_PLAYER_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  html,body{margin:0;height:100%;background:#000}
-  #v{width:100%;height:100%;object-fit:contain;background:#000}
-  #msg{color:#bbb;font-family:sans-serif;text-align:center;padding:1.2em;font-size:15px}
+  html,body{margin:0;height:100%;background:#000;font-family:sans-serif}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #v{flex:1 1 auto;min-height:0;width:100%;background:#000;object-fit:contain}
+  #msg{color:#bbb;text-align:center;padding:1em;font-size:15px}
+  #strip{display:flex;gap:6px;overflow-x:auto;padding:6px;background:#111;flex:0 0 auto}
+  #strip:empty{display:none}
+  .thumb{flex:0 0 auto;width:92px;cursor:pointer;border:2px solid transparent;border-radius:5px;background:#1b1b1b}
+  .thumb.active{border-color:#3aa17e}
+  .thumb img{width:100%;height:52px;object-fit:cover;border-radius:3px 3px 0 0;display:block;background:#222}
+  .thumb .t{color:#cfcfcf;font-size:11px;text-align:center;padding:2px 0}
 </style>
 </head>
 <body>
-<video id="v" controls autoplay muted playsinline></video>
-<div id="msg" style="display:none">No clip yet.</div>
+<div id="wrap">
+  <video id="v" controls autoplay muted playsinline></video>
+  <div id="msg" style="display:none">No clip yet.</div>
+  <div id="strip"></div>
+</div>
 <script>
 (function(){
-  var v=document.getElementById('v'), msg=document.getElementById('msg'), tries=0;
-  function fail(t){ v.style.display='none'; msg.style.display='block'; if(t) msg.textContent=t; }
-  // Fetch the current event id from a PUBLIC json (sidecar-written). No auth
-  // token needed. Play the /local clip (byte-range 206 supported, unlike the
-  // Frigate notifications proxy which returns 200 and breaks <video>).
-  function load(){
-    fetch('/local/doorbell-latest.json?t=' + Date.now(), {cache:'no-store'})
-     .then(function(r){ return r.json(); })
-     .then(function(j){
-       var id = j && j.event_id;
-       if(!id){ fail('No clip yet.'); return; }
-       v.style.display='block'; msg.style.display='none';
-       v.src = '/local/frigate_clips/' + id + '.mp4';
-     })
-     .catch(function(){ fail('No clip yet.'); });
+  var v=document.getElementById('v'), msg=document.getElementById('msg'), strip=document.getElementById('strip'), tries=0, cur=null;
+  function fail(t){ v.style.display='none'; if(t){ msg.style.display='block'; msg.textContent=t; } }
+  function param(n){ var m=new RegExp('[?&]'+n+'=([^&]+)').exec(location.search); return m?decodeURIComponent(m[1]):null; }
+  function fmt(ts){ try{ return new Date(ts*1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); }catch(e){ return ''; } }
+  function play(id){
+    if(!id){ fail('No clip yet.'); return; }
+    cur=id; tries=0;
+    v.style.display=''; msg.style.display='none';
+    v.src='/local/frigate_clips/'+id+'.mp4';
+    for(var i=0;i<strip.children.length;i++){ strip.children[i].classList.toggle('active', strip.children[i].getAttribute('data-id')===id); }
   }
-  // The clip is staged ~15-25s after the visitor appears; retry while it 404s.
-  v.addEventListener('error', function(){
-    if(tries++ < 12){ setTimeout(function(){ v.load(); }, 3000); }
-    else { fail('Clip not ready - reload in a moment.'); }
-  });
-  load();
+  // clip is staged ~15-25s after the visitor appears; retry while it 404s
+  v.addEventListener('error', function(){ if(cur && tries++<12){ setTimeout(function(){ v.load(); }, 3000); } });
+  function build(clips){
+    clips.forEach(function(c){
+      var d=document.createElement('div'); d.className='thumb'; d.setAttribute('data-id', c.id);
+      d.innerHTML='<img src="/api/frigate/notifications/'+c.id+'/thumbnail.jpg" onerror="this.style.visibility=\'hidden\'"><div class="t">'+fmt(c.ts)+'</div>';
+      d.addEventListener('click', function(){ play(c.id); });
+      strip.appendChild(d);
+    });
+  }
+  // ?event=<id> plays a specific clip (per-notification deep link); else newest.
+  var wanted=param('event');
+  fetch('/local/doorbell-clips.json?t='+Date.now(),{cache:'no-store'})
+   .then(function(r){ return r.json(); })
+   .then(function(j){ var clips=(j&&j.clips)||[]; build(clips); play(wanted || (clips[0] && clips[0].id)); })
+   .catch(function(){
+     if(wanted){ play(wanted); return; }
+     fetch('/local/doorbell-latest.json?t='+Date.now(),{cache:'no-store'})
+      .then(function(r){ return r.json(); }).then(function(j){ play(j && j.event_id); })
+      .catch(function(){ fail('No clip yet.'); });
+   });
 })();
 </script>
 </body>
@@ -224,6 +244,28 @@ def write_latest_pointer(evt_id: str) -> None:
             json.dumps({"event_id": evt_id, "ts": int(time.time())}), encoding="utf-8")
     except Exception:
         log.exception("failed to write doorbell-latest.json (continuing anyway)")
+
+
+def write_clips_manifest() -> None:
+    """List recent STAGED clips (newest first) to a PUBLIC json for the player's
+    recent-clips picker strip. Derived purely from the files on disk — a Frigate
+    event id encodes its start timestamp (`<unix>.<...>-<rand>`), so this needs no
+    in-memory state and survives restarts. Only lists clips that are actually
+    playable (staged under CLIP_DIR)."""
+    try:
+        files = sorted(CLIP_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[:12]
+        clips = []
+        for f in files:
+            eid = f.stem
+            try:
+                ts = int(float(eid.split(".")[0]))
+            except (ValueError, IndexError):
+                ts = int(f.stat().st_mtime)
+            clips.append({"id": eid, "ts": ts})
+        (Path("/ha_config/www") / "doorbell-clips.json").write_text(
+            json.dumps({"clips": clips}), encoding="utf-8")
+    except Exception:
+        log.exception("failed to write doorbell-clips.json (continuing anyway)")
 
 # Track which event IDs we've already kicked off (with the time we did so, for
 # pruning). A noisy /events stream sends many new/update/end messages per event;
@@ -344,6 +386,7 @@ def stage_player_clip(src_mp4: Path, evt_id: str) -> None:
              "-i", str(src_mp4), "-c", "copy", "-movflags", "+faststart", str(dest)],
             check=True)
         log.info("evt=%s player clip staged: %s (%d bytes)", evt_id, dest, dest.stat().st_size)
+        write_clips_manifest()
     except subprocess.CalledProcessError as e:
         log.error("evt=%s player-clip remux failed rc=%s", evt_id, e.returncode)
         dest.unlink(missing_ok=True)
@@ -432,6 +475,7 @@ def cleanup_old_gifs() -> None:
             pass
     if removed:
         log.info("cleanup: removed %d old gif/clip file(s) older than %dh", removed, GIF_RETENTION_HOURS)
+        write_clips_manifest()   # drop pruned clips from the picker
     # prune the de-dup map — an event id never recurs after a couple hours.
     with _handled_lock:
         stale = [k for k, t in _handled.items() if t < time.time() - 7200]
