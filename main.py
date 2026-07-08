@@ -67,6 +67,9 @@ GIF_WINDOW_SECONDS = int(os.environ.get("GIF_WINDOW_SECONDS", str(os.environ.get
 GIF_SPEEDUP = float(os.environ.get("GIF_SPEEDUP", "3.0"))
 GIF_RETENTION_HOURS = int(os.environ.get("GIF_RETENTION_HOURS", "24"))
 CLIP_FETCH_TIMEOUT_S = int(os.environ.get("CLIP_FETCH_TIMEOUT_S", "45"))
+# How long to keep polling for the FULL event clip, which only exists once the
+# event ENDS + Frigate finalizes it. Covers a long linger (default 5 min).
+FULL_CLIP_TIMEOUT_S = int(os.environ.get("FULL_CLIP_TIMEOUT_S", "300"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -385,11 +388,49 @@ def stage_player_clip(src_mp4: Path, evt_id: str) -> None:
             ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
              "-i", str(src_mp4), "-c", "copy", "-movflags", "+faststart", str(dest)],
             check=True)
-        log.info("evt=%s player clip staged: %s (%d bytes)", evt_id, dest, dest.stat().st_size)
+        log.info("evt=%s quick clip staged (full clip to follow): %s (%d bytes)", evt_id, dest, dest.stat().st_size)
         write_clips_manifest()
     except subprocess.CalledProcessError as e:
         log.error("evt=%s player-clip remux failed rc=%s", evt_id, e.returncode)
         dest.unlink(missing_ok=True)
+
+
+def stage_full_clip(evt_id: str) -> None:
+    """Overwrite the quick placeholder with the FULL event clip — the entire time
+    the person was tracked, plus record pre/post-capture. The event clip only
+    exists AFTER the event ends and Frigate finalizes it, so we poll patiently
+    (a long visit finalizes late). Runs in its own thread so it never delays the
+    GIF/notification path."""
+    url = f"{FRIGATE_URL}/api/events/{evt_id}/clip.mp4"
+    dest = CLIP_DIR / f"{evt_id}.mp4"
+    deadline = time.time() + FULL_CLIP_TIMEOUT_S
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / f"{evt_id}.mp4"
+        while time.time() < deadline:
+            try:
+                urlretrieve(url, raw)
+                if raw.stat().st_size > 0:
+                    break
+                raw.unlink(missing_ok=True)
+            except HTTPError as e:
+                # 404 = event not ended / clip not finalized yet; expected while polling.
+                if e.code not in (404, 400):
+                    log.warning("evt=%s full-clip fetch HTTP %s", evt_id, e.code)
+            except URLError as e:
+                log.warning("evt=%s full-clip fetch URL error: %s", evt_id, e)
+            time.sleep(5)
+        else:
+            log.info("evt=%s full clip not finalized within %ds — keeping quick clip", evt_id, FULL_CLIP_TIMEOUT_S)
+            return
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", str(raw), "-c", "copy", "-movflags", "+faststart", str(dest)],
+                check=True)
+            log.info("evt=%s full clip staged (replaced quick): %d bytes", evt_id, dest.stat().st_size)
+            write_clips_manifest()
+        except subprocess.CalledProcessError as e:
+            log.error("evt=%s full-clip remux failed rc=%s", evt_id, e.returncode)
 
 
 def process_event(client: mqtt.Client, evt_id: str, camera: str, start_ts: int) -> None:
@@ -422,6 +463,9 @@ def process_event(client: mqtt.Client, evt_id: str, camera: str, start_ts: int) 
                 "transcode_ms": took_ms,
             })
             client.publish(f"frigate-gifs/ready/{evt_id}", payload, qos=0, retain=False)
+        # Upgrade the quick placeholder to the full-duration event clip once it
+        # finalizes — runs independently so it never blocks the GIF/notification.
+        threading.Thread(target=stage_full_clip, args=(evt_id,), daemon=True).start()
     except Exception:
         log.exception("evt=%s processing failed", evt_id)
 
