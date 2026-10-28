@@ -39,20 +39,31 @@ doesn't ship a writable `/tmp` palette workflow. A tiny sidecar is one container
 ## Pre-deploy checklist
 
 HA runs in HA-OS in a Proxmox VM, so we write to its `/config/www` via the
-**Samba share addon** (already installed) using Docker's built-in `cifs`
-volume driver. No bind-mount, no host fstab changes.
+**Samba share addon**. The share is mounted on the **host** (home-debian) by
+autofs at `/mnt/hass` (`/etc/auto.smb.shares`, creds `/home/josh/.smb.hass`)
+and bind-mounted into the container with `rslave` propagation.
 
-1. **Copy `.env.example` → `.env`** and fill in:
-   - `MQTT_PASS` — Frigate's MQTT user works as-is
-   - `SMB_USER` / `SMB_PASS` — from the HA UI: Settings → Add-ons → Samba share →
-     Configuration tab. The username defaults to `josh`.
-   - `HA_HOST` — `192.168.10.103` for the yakhome install.
+> **Never use a Docker `cifs` volume here.** Volume mounts are a container-start
+> precondition; if HA's SMB is down (every HA reboot, every pve power event) the
+> start fails with exit 128 before `restart: always` kicks in, and nothing ever
+> retries. That silently killed doorbell GIFs three times in 2026.
+
+1. **Copy `.env.example` → `.env`** and fill in `MQTT_PASS` (Frigate's MQTT
+   user works as-is).
 
 2. **Deploy via Komodo**: stack is `yakhome-ca/frigate-gif-sidecar`. Let Komodo
    clone, build the image, and bring it up.
 
-3. The cifs volume mount needs the host kernel `cifs` module — Debian ships it
-   by default, so home-debian is fine.
+## Reliability
+
+- Container start never depends on HA. `main.py` waits for the share instead
+  of crashing.
+- Every 60s it publishes `frigate-gifs/heartbeat` `{"output_ok": bool, "ts": int}`.
+  HA's `binary_sensor.doorbell_gif_sidecar` (MQTT, `expire_after`) goes
+  unavailable/off when the sidecar is dead or can't write, and an HA
+  automation pushes an alert after 15 min.
+- The Docker healthcheck is liveness-only (`/tmp/alive` freshness), so autoheal
+  only restarts a genuinely wedged process, not one waiting out an HA reboot.
 
 ## Verifying it's working
 

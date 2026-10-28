@@ -4,10 +4,18 @@
 # events, transcodes to a low-fps palette-optimized GIF, writes it where HA can
 # serve it at /local/frigate_gifs/<id>.gif, and publishes frigate-gifs/ready/<id>.
 #
-# HA runs in HA-OS on 192.168.10.103, NOT as a docker container — so we can't
-# bind-mount HA's /config/www. Instead we use Docker's built-in cifs volume
-# driver to mount the HA Samba addon's `config` share, and write into
-# /config/www/frigate_gifs/ over SMB. HA serves it at /local/frigate_gifs/.
+# HA runs in HA-OS on 192.168.10.103, NOT as a docker container — so we write
+# into HA's /config/www over the HA Samba addon's `config` share. The share is
+# mounted on the HOST by autofs (/etc/auto.smb.shares → /mnt/hass) and
+# bind-mounted in. HA serves the files at /local/frigate_gifs/.
+#
+# Do NOT go back to a Docker cifs volume: a volume mount is a container-START
+# precondition, and when HA's SMB isn't up yet (every HA reboot / pve power
+# event) start fails with exit 128 *before* `restart: always` applies — nothing
+# ever retries. That killed doorbell GIFs 2026-06-24 (6d), 2026-08-08 (13d) and
+# 2026-08-25 (2 months). With the host autofs mount the container always
+# starts; main.py waits for the share, and `rslave` propagation lets the
+# container see the share again after autofs/cifs reconnects.
 services:
   frigate-gif-sidecar:
     container_name: frigate-gif-sidecar
@@ -28,9 +36,16 @@ services:
       # and target the www/frigate_gifs subdir. main.py mkdirs it if needed.
       OUTPUT_DIR: /ha_config/www/frigate_gifs
     volumes:
-      - ha_config:/ha_config
+      - type: bind
+        source: /mnt/hass
+        target: /ha_config
+        bind:
+          propagation: rslave
+    # Liveness only: the heartbeat thread touches /tmp/alive every 60s. Don't
+    # probe MQTT/HA here — those are down during every HA reboot and an
+    # autoheal restart can't fix them. HA alerts on missing heartbeats instead.
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import socket,os; s=socket.create_connection((os.environ['MQTT_HOST'], int(os.environ.get('MQTT_PORT','1883'))), timeout=3); s.close()\""]
+      test: ["CMD-SHELL", "python -c \"import os,time,sys; sys.exit(0 if time.time()-os.path.getmtime('/tmp/alive') < 180 else 1)\""]
       interval: 60s
       timeout: 5s
       retries: 3
@@ -40,15 +55,3 @@ services:
         max-size: "10m"
         max-file: "3"
 
-volumes:
-  ha_config:
-    driver: local
-    driver_opts:
-      type: cifs
-      # vers=3.0 = SMB3 (HA Samba addon supports it). soft = don't hang the container
-      # on broker hiccups. nofail wouldn't apply here since this is a docker driver,
-      # but `soft` + healthcheck restart gives us self-healing.
-      # uid/gid 1000 is what HA-OS's Samba addon maps writes to — files end up
-      # owned by the addon's internal user, readable by HA.
-      o: "username=${SMB_USER:?set SMB_USER in .env},password=${SMB_PASS:?set SMB_PASS in .env},rw,vers=3.0,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,soft"
-      device: "//${HA_HOST:?set HA_HOST in .env}/config"

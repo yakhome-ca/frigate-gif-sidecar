@@ -79,8 +79,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("gif-sidecar")
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-CLIP_DIR.mkdir(parents=True, exist_ok=True)
+# OUTPUT_DIR lives on HA's Samba share (host autofs mount, bind-mounted in).
+# It is briefly unreachable whenever HA reboots, so never crash on it — wait.
+HEARTBEAT_INTERVAL_S = 60
+ALIVE_FILE = Path("/tmp/alive")
+
+
+def ensure_output_dirs() -> bool:
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        CLIP_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError as e:
+        log.warning("output dir %s not reachable yet: %s", OUTPUT_DIR, e)
+        return False
+
+
+while not ensure_output_dirs():
+    time.sleep(10)
 
 # --- doorbell redirect helper -----------------------------------------------
 # We also ship a tiny static HTML page that the notification clickAction points
@@ -536,6 +552,36 @@ def cleanup_loop() -> None:
         time.sleep(3600)
 
 
+# --- heartbeat ---------------------------------------------------------------
+# HA watches frigate-gifs/heartbeat (expire_after) so a dead or stuck sidecar
+# raises an alert instead of silently dropping doorbell GIFs for weeks.
+# output_ok = we can actually write to HA's www dir right now.
+
+def output_writable() -> bool:
+    probe = OUTPUT_DIR / ".heartbeat"
+    try:
+        ensure_output_dirs()
+        probe.write_text(str(int(time.time())))
+        return True
+    except OSError:
+        return False
+
+
+def heartbeat_loop(client: mqtt.Client) -> None:
+    while True:
+        ok = output_writable()
+        ALIVE_FILE.touch()   # docker healthcheck: the process is alive, not wedged
+        if client.is_connected():
+            client.publish(
+                "frigate-gifs/heartbeat",
+                json.dumps({"output_ok": ok, "ts": int(time.time())}),
+                qos=0, retain=False,
+            )
+        if not ok:
+            log.warning("heartbeat: %s not writable", OUTPUT_DIR)
+        time.sleep(HEARTBEAT_INTERVAL_S)
+
+
 # --- main --------------------------------------------------------------------
 
 def on_connect(client: mqtt.Client, _userdata, _flags, rc, _props=None) -> None:
@@ -562,6 +608,7 @@ def main() -> None:
     client.on_connect = on_connect
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=1, max_delay=30)
+    threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
 
     # graceful shutdown
     stop = threading.Event()
